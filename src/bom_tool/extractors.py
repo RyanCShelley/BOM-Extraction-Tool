@@ -286,6 +286,128 @@ def _search_interconnection_subtype(page: PageText, allowed_values: str) -> Matc
     return None
 
 
+_BREAKER_BRANDS = ["EATON", "SIEMENS", "SQUARE D", "GE"]
+
+
+def _extract_new_breaker_capacity(pages: list[PageText]) -> MatchResult | None:
+    """Extract the new solar AC disconnect/breaker capacity from PV-6.
+
+    Looks for patterns like '(N) 100A ... AC DISCONNECT' or '(N) 60A ... DISCONNECT'.
+    Joins multiline text since labels span lines in PDF extraction.
+    """
+    for page in pages:
+        text = " ".join(page.text.split())
+        # Pattern: (N) followed by capacity, then AC DISCONNECT or similar
+        m = re.search(r"\(N\)\s*(\d+)\s*A\b[^()]*?(?:AC\s*DISCONNECT|FUSED\s*(?:AC\s*)?DISCONNECT|DISCONNECT)", text, re.IGNORECASE)
+        if m:
+            return MatchResult(
+                value=m.group(1),
+                quote=m.group(0)[:80],
+                confidence=0.88,
+                extractor_name="new_breaker_capacity",
+            )
+        # Fallback: look for (N) XXA SOLAR or LOAD CENTER
+        m = re.search(r"\(N\)\s*(\d+)\s*A\b[^()]*?(?:SOLAR|LOAD\s*CENTER)", text, re.IGNORECASE)
+        if m:
+            return MatchResult(
+                value=m.group(1),
+                quote=m.group(0)[:80],
+                confidence=0.80,
+                extractor_name="new_breaker_capacity_loadcenter",
+            )
+    return None
+
+
+def _extract_breaker_brand(pages: list[PageText], allowed_values: str) -> MatchResult | None:
+    """Extract brand of new solar breaker/disconnect from PV-6.
+
+    Searches for known brands near the (N) AC disconnect on PV-6.
+    """
+    candidates = [x.strip() for x in allowed_values.strip("[]").split(",") if x.strip()]
+    # Sort longest first for specificity (e.g., "SQUARE D - HOMELINE" before "SQUARE D")
+    candidates.sort(key=len, reverse=True)
+
+    for page in pages:
+        text_upper = " ".join(page.text.upper().split())
+        for candidate in candidates:
+            # Check full candidate (e.g., "SQUARE D - HOMELINE")
+            if candidate.upper() in text_upper:
+                return MatchResult(
+                    value=candidate,
+                    quote=candidate,
+                    confidence=0.88,
+                    extractor_name="breaker_brand_exact",
+                )
+        # Also check base brand names
+        for brand in _BREAKER_BRANDS:
+            if brand in text_upper:
+                # Map to the best matching allowed value
+                match_val = next((c for c in candidates if brand in c.upper()), brand)
+                return MatchResult(
+                    value=match_val,
+                    quote=brand,
+                    confidence=0.82,
+                    extractor_name="breaker_brand_keyword",
+                )
+    return None
+
+
+def _extract_main_breaker_capacity(pages: list[PageText]) -> MatchResult | None:
+    """Extract existing main breaker/service capacity from PV-6.
+
+    Looks for patterns like '(E) 200A MAIN' or '(E) 200A/2P ... MAIN SERVICE'.
+    """
+    for page in pages:
+        text = " ".join(page.text.split())
+        # Pattern: (E) capacity near MAIN BREAKER/SERVICE
+        m = re.search(r"\(E\)\s*(\d+)\s*A(?:/\d+P)?\b[^()]*?MAIN", text, re.IGNORECASE)
+        if m:
+            return MatchResult(
+                value=m.group(1),
+                quote=m.group(0)[:80],
+                confidence=0.88,
+                extractor_name="main_breaker_capacity",
+            )
+        # Fallback: look for "MAIN BREAKER" or "200A MAIN" anywhere
+        m = re.search(r"(\d+)\s*A\s*MAIN\s*(?:BREAKER|SERVICE)", text, re.IGNORECASE)
+        if m:
+            return MatchResult(
+                value=m.group(1),
+                quote=m.group(0)[:80],
+                confidence=0.80,
+                extractor_name="main_breaker_capacity_fallback",
+            )
+    return None
+
+
+def _detect_new_main_breaker(pages: list[PageText]) -> MatchResult | None:
+    """Detect if a NEW main breaker is present on PV-6.
+
+    If '(N)' appears before any 'MAIN BREAKER' or 'MAIN SERVICE' reference -> YES.
+    If only '(E)' (existing) before main references -> NO.
+    """
+    for page in pages:
+        text = " ".join(page.text.split())
+        if re.search(r"\(N\)[^()]*MAIN\s*(?:BREAKER|SERVICE)", text, re.IGNORECASE):
+            return MatchResult(
+                value="YES",
+                quote="New (N) main breaker found on diagram",
+                confidence=0.85,
+                extractor_name="new_main_breaker_detect",
+            )
+    # If we found main breaker references but all are (E), then NO
+    for page in pages:
+        text = " ".join(page.text.split())
+        if re.search(r"\(E\)[^()]*MAIN\s*(?:BREAKER|SERVICE)", text, re.IGNORECASE):
+            return MatchResult(
+                value="NO",
+                quote="All main breaker references are (E) existing",
+                confidence=0.82,
+                extractor_name="new_main_breaker_detect",
+            )
+    return None
+
+
 def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[MatchResult | None, PageText | None]:
     name = _normalize(field.field_name)
     scoped_pages = candidate_pages(pages, field.data_point_location)
@@ -344,6 +466,37 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
             if found:
                 return found, pv6_page
 
+    # Electrical fields: extract from PV-6 single line diagram
+    if name == "ifloadsideconnectioncapacityofnewbreaker":
+        pv6_pages = _get_pages_by_label(pages, "PV-6")
+        found = _extract_new_breaker_capacity(pv6_pages)
+        if found:
+            return found, pv6_pages[0] if pv6_pages else pages[0]
+
+    if name == "ifloadsideconnectionbrandofnewbreaker" and field.allowed_values:
+        pv6_pages = _get_pages_by_label(pages, "PV-6")
+        found = _extract_breaker_brand(pv6_pages, field.allowed_values)
+        if found:
+            return found, pv6_pages[0] if pv6_pages else pages[0]
+
+    if name == "newmainbreakerforsubpanelformainelectricalpanel":
+        pv6_pages = _get_pages_by_label(pages, "PV-6")
+        found = _detect_new_main_breaker(pv6_pages)
+        if found:
+            return found, pv6_pages[0] if pv6_pages else pages[0]
+
+    if name == "capacityofnewmainbreakerforsubpanelformainelectricalpanel":
+        pv6_pages = _get_pages_by_label(pages, "PV-6")
+        found = _extract_main_breaker_capacity(pv6_pages)
+        if found:
+            return found, pv6_pages[0] if pv6_pages else pages[0]
+
+    if name == "brandofnewmainbreakerforsubpanelformainelectricalpanel" and field.allowed_values:
+        pv6_pages = _get_pages_by_label(pages, "PV-6")
+        found = _extract_breaker_brand(pv6_pages, field.allowed_values)
+        if found:
+            return found, pv6_pages[0] if pv6_pages else pages[0]
+
     # --- Block B: Fields using scoped_pages ---
 
     row_map = {
@@ -354,7 +507,7 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
         "numberofconnectionstoroof2": "TOP MOUNT",
     }
 
-    phrase_map = {"capacityofnewmainbreakerforsubpanelformainelectricalpanel": "MAIN BREAKER"}
+    phrase_map: dict[str, str] = {}
 
     for page in scoped_pages:
         if name in row_map:
@@ -378,6 +531,18 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
             found = _count_roofs_in_roof_table(page)
             if found:
                 return found, page
+            # Also try counting "PHOTOVOLTAIC ARRAY ON MP-XX" references on site plans
+            mp_ids = set(re.findall(r"MP-(\d+)", page.text))
+            if mp_ids:
+                return (
+                    MatchResult(
+                        value=str(len(mp_ids)),
+                        quote=f"Array mount points: {sorted(mp_ids, key=int)}",
+                        confidence=0.82,
+                        extractor_name="roof_count_from_mp_refs",
+                    ),
+                    page,
+                )
 
         if "typeofroof" in name and field.allowed_values:
             found = _search_allowed_value(page, field.allowed_values)
@@ -403,34 +568,58 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
                 return found, page
 
         if name == "typeofinterconnection":
+            # Join lines since NEC references often span multiple lines
             text_upper = page.text.upper()
-            if "FEEDER TAP" in text_upper:
-                return (
-                    MatchResult(
-                        value="FEEDER TAP",
-                        quote="FEEDER TAP",
-                        confidence=0.9,
-                        extractor_name="interconnection_keyword",
-                    ),
-                    page,
-                )
-            if "LINE SIDE TAP" in text_upper:
-                return (
-                    MatchResult(
-                        value="LINE SIDE TAP",
-                        quote="LINE SIDE TAP",
-                        confidence=0.9,
-                        extractor_name="interconnection_keyword",
-                    ),
-                    page,
-                )
-            if "LOAD SIDE TAP" in text_upper or "LOAD SIDE CONNECTION" in text_upper:
+            text_joined = " ".join(text_upper.split())
+            for txt in (text_upper, text_joined):
+                if "FEEDER TAP" in txt:
+                    return (
+                        MatchResult(
+                            value="FEEDER TAP",
+                            quote="FEEDER TAP",
+                            confidence=0.9,
+                            extractor_name="interconnection_keyword",
+                        ),
+                        page,
+                    )
+                if "LINE SIDE TAP" in txt:
+                    return (
+                        MatchResult(
+                            value="LINE SIDE TAP",
+                            quote="LINE SIDE TAP",
+                            confidence=0.9,
+                            extractor_name="interconnection_keyword",
+                        ),
+                        page,
+                    )
+                if "LOAD SIDE TAP" in txt or "LOAD SIDE CONNECTION" in txt:
+                    return (
+                        MatchResult(
+                            value="LOAD SIDE CONNECTION",
+                            quote="LOAD SIDE TAP" if "LOAD SIDE TAP" in txt else "LOAD SIDE CONNECTION",
+                            confidence=0.9,
+                            extractor_name="interconnection_keyword",
+                        ),
+                        page,
+                    )
+            # Also check NEC references as fallback
+            if re.search(r"NEC\s*705\.12\s*\(B\)", text_joined):
                 return (
                     MatchResult(
                         value="LOAD SIDE CONNECTION",
-                        quote="LOAD SIDE TAP" if "LOAD SIDE TAP" in text_upper else "LOAD SIDE CONNECTION",
-                        confidence=0.9,
-                        extractor_name="interconnection_keyword",
+                        quote="NEC 705.12(B) reference",
+                        confidence=0.82,
+                        extractor_name="interconnection_nec_ref",
+                    ),
+                    page,
+                )
+            if re.search(r"NEC\s*705\.12\s*\(A\)", text_joined):
+                return (
+                    MatchResult(
+                        value="LINE SIDE TAP",
+                        quote="NEC 705.12(A) reference",
+                        confidence=0.82,
+                        extractor_name="interconnection_nec_ref",
                     ),
                     page,
                 )
