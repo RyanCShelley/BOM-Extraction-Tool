@@ -408,6 +408,26 @@ def _detect_new_main_breaker(pages: list[PageText]) -> MatchResult | None:
     return None
 
 
+def _detect_interconnection_type(page: PageText) -> MatchResult | None:
+    """Detect interconnection type from a page using keywords and NEC references."""
+    text_upper = page.text.upper()
+    text_joined = " ".join(text_upper.split())
+    for txt in (text_upper, text_joined):
+        if "FEEDER TAP" in txt:
+            return MatchResult(value="FEEDER TAP", quote="FEEDER TAP", confidence=0.9, extractor_name="interconnection_keyword")
+        if "LINE SIDE TAP" in txt:
+            return MatchResult(value="LINE SIDE TAP", quote="LINE SIDE TAP", confidence=0.9, extractor_name="interconnection_keyword")
+        if "LOAD SIDE TAP" in txt or "LOAD SIDE CONNECTION" in txt:
+            quote = "LOAD SIDE TAP" if "LOAD SIDE TAP" in txt else "LOAD SIDE CONNECTION"
+            return MatchResult(value="LOAD SIDE CONNECTION", quote=quote, confidence=0.9, extractor_name="interconnection_keyword")
+    # NEC reference fallback (handles missing "NEC" prefix and OCR typos like "70512")
+    if re.search(r"705\.?12\s*\(B\)", text_joined):
+        return MatchResult(value="LOAD SIDE CONNECTION", quote="705.12(B) reference", confidence=0.82, extractor_name="interconnection_nec_ref")
+    if re.search(r"705\.?12\s*\(A\)", text_joined):
+        return MatchResult(value="LINE SIDE TAP", quote="705.12(A) reference", confidence=0.82, extractor_name="interconnection_nec_ref")
+    return None
+
+
 def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[MatchResult | None, PageText | None]:
     name = _normalize(field.field_name)
     scoped_pages = candidate_pages(pages, field.data_point_location)
@@ -460,11 +480,20 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
         )
 
     if name == "subtypeofinterconnection" and field.allowed_values:
-        pv6_pages = _get_pages_by_label(pages, "PV-6")
-        for pv6_page in pv6_pages:
-            found = _search_interconnection_subtype(pv6_page, field.allowed_values)
+        # Search PV-6 and PV-7 for subtype info
+        search_pages = _get_pages_by_label(pages, "PV-6") + _get_pages_by_label(pages, "PV-7")
+        for sp in search_pages:
+            found = _search_interconnection_subtype(sp, field.allowed_values)
             if found:
-                return found, pv6_page
+                return found, sp
+
+    if name == "typeofinterconnection":
+        # Search PV-6 and PV-7 for interconnection type keywords and NEC references
+        search_pages = _get_pages_by_label(pages, "PV-6") + _get_pages_by_label(pages, "PV-7")
+        for sp in search_pages:
+            found = _detect_interconnection_type(sp)
+            if found:
+                return found, sp
 
     # Electrical fields: extract from PV-6 single line diagram
     if name == "ifloadsideconnectioncapacityofnewbreaker":
@@ -566,63 +595,6 @@ def _extract_with_rules(field: IntakeField, pages: list[PageText]) -> tuple[Matc
             found = _search_attachment_type(page, field.allowed_values)
             if found:
                 return found, page
-
-        if name == "typeofinterconnection":
-            # Join lines since NEC references often span multiple lines
-            text_upper = page.text.upper()
-            text_joined = " ".join(text_upper.split())
-            for txt in (text_upper, text_joined):
-                if "FEEDER TAP" in txt:
-                    return (
-                        MatchResult(
-                            value="FEEDER TAP",
-                            quote="FEEDER TAP",
-                            confidence=0.9,
-                            extractor_name="interconnection_keyword",
-                        ),
-                        page,
-                    )
-                if "LINE SIDE TAP" in txt:
-                    return (
-                        MatchResult(
-                            value="LINE SIDE TAP",
-                            quote="LINE SIDE TAP",
-                            confidence=0.9,
-                            extractor_name="interconnection_keyword",
-                        ),
-                        page,
-                    )
-                if "LOAD SIDE TAP" in txt or "LOAD SIDE CONNECTION" in txt:
-                    return (
-                        MatchResult(
-                            value="LOAD SIDE CONNECTION",
-                            quote="LOAD SIDE TAP" if "LOAD SIDE TAP" in txt else "LOAD SIDE CONNECTION",
-                            confidence=0.9,
-                            extractor_name="interconnection_keyword",
-                        ),
-                        page,
-                    )
-            # Also check NEC references as fallback
-            if re.search(r"NEC\s*705\.12\s*\(B\)", text_joined):
-                return (
-                    MatchResult(
-                        value="LOAD SIDE CONNECTION",
-                        quote="NEC 705.12(B) reference",
-                        confidence=0.82,
-                        extractor_name="interconnection_nec_ref",
-                    ),
-                    page,
-                )
-            if re.search(r"NEC\s*705\.12\s*\(A\)", text_joined):
-                return (
-                    MatchResult(
-                        value="LINE SIDE TAP",
-                        quote="NEC 705.12(A) reference",
-                        confidence=0.82,
-                        extractor_name="interconnection_nec_ref",
-                    ),
-                    page,
-                )
 
     return None, None
 
